@@ -51,10 +51,13 @@
 
 # ✅ STEP 1: 필수 라이브러리 설치
 # ➤ Unsloth는 일반 transformers 대비 2배 빠른 속도와 60% 메모리 절약을 제공합니다.
+# ➤ trl은 원본 프리셋의 SFTTrainer 인자(tokenizer, dataset_text_field, max_seq_length)와 맞는 버전으로 고정합니다.
 get_ipython().system('pip install bitsandbytes==0.48.0')
 get_ipython().system('pip install -q "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"')
-get_ipython().system('pip install -q --no-deps trl peft accelerate  datasets')
+get_ipython().system('pip install -q --no-deps trl==0.11.4 peft accelerate datasets')
 print("✅ 설치 완료")
+print("⚠️ Colab에서 처음 설치했거나 이 셀을 다시 실행했다면, 런타임을 재시작한 뒤 STEP 2부터 다시 실행하세요.")
+print("   Runtime → Restart runtime 실행 후 STEP 2부터 진행하면 PicklingError를 피할 수 있습니다.")
 
 
 # ## 1단계. 모델 로딩
@@ -399,10 +402,10 @@ from transformers import TrainingArguments
 from trl import SFTTrainer
 
 training_args = TrainingArguments(
-    per_device_train_batch_size = 4,     # 포인트: GPU 하나가 한 번에 처리할 샘플 수
-    gradient_accumulation_steps = 4,     # 포인트: 4번 모아 큰 배치(4×4=16)처럼 학습 — 메모리 절약
+    per_device_train_batch_size = 2,     # 포인트: GPU 하나가 한 번에 처리할 샘플 수
+    gradient_accumulation_steps = 4,     # 포인트: 4번 모아 큰 배치(2×4=8)처럼 학습 — 메모리 절약
     num_train_epochs = 3,                # 포인트: 전체 데이터를 3바퀴 반복 학습
-    max_steps = 100,                     # 포인트: 빠른 테스트용 상한 (실제 학습 시 이 줄 제거)
+    max_steps = 30,                      # 포인트: Colab T4 테스트용 상한 (더 학습하려면 80~100으로 늘리세요)
     learning_rate = 2e-4,                # 포인트: 가중치 업데이트 크기 — 너무 크면 불안정, 너무 작으면 느림
     warmup_steps = 10,                   # 포인트: 초반 10 step 동안 학습률을 서서히 올려 안정적인 시작
     bf16 = is_bfloat16_supported(),      # 포인트: A100 등 최신 GPU에서 bfloat16 사용 (속도↑, 안정성↑)
@@ -421,7 +424,7 @@ trainer = SFTTrainer(
     tokenizer = tokenizer,
     train_dataset = train_data,
     dataset_text_field = "text",  #텍스트가 담긴 컬럼 이름 — format_instruction에서 어떤 키를 썼나요?
-    max_seq_length = 2048,
+    max_seq_length = 1024,
     dataset_num_proc = 2,        # 포인트: 전처리 병렬 처리 수
     packing = False,
     args = training_args,
