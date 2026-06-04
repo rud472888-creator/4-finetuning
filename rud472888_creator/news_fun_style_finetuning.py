@@ -1,0 +1,614 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# # 뉴스 재미있게 설명하는 말투 LoRA 파인튜닝
+# 
+# 사전학습된 **Qwen2.5-1.5B-Instruct** 모델을 작은 합성 데이터셋으로 파인튜닝해서, 딱딱한 뉴스 이슈를 쉽고 재밌게 설명하는 모델을 만듭니다.
+# 
+# | 항목 | 내용 |
+# |---|---|
+# | **모델** | `unsloth/Qwen2.5-1.5B-Instruct` |
+# | **데이터셋** | 직접 만든 뉴스 설명 스타일 합성 데이터 64개 |
+# | **태스크** | 뉴스 이슈 → 쉽고 재밌는 3문장 설명 |
+# | **방법** | LoRA Fine-tuning |
+# 
+# **모델 선택 이유:** Colab 무료 T4에서도 돌릴 수 있는 1.5B급 모델이라 학습 실패 위험이 낮습니다.  
+# **데이터셋 선택 이유:** 목표가 최신 사실 학습이 아니라 말투와 응답 구조 학습이므로, 범용 이슈 기반 합성 데이터가 적합합니다.
+# 
+# > 목표 스타일: 핵심을 먼저 말하고, 쉬운 비유를 붙이고, 마지막에 왜 중요한지 알려주는 뉴스 진행자 톤입니다.
+# 
+
+# ## Colab GPU 설정
+# 
+# 1. 상단 메뉴에서 **런타임**을 클릭합니다.
+# 2. **런타임 유형 변경**을 클릭합니다.
+# 3. 하드웨어 가속기를 **T4 GPU**로 선택합니다.
+# 4. 저장 후 런타임을 다시 시작합니다.
+# 
+# GPU 없이 실행하면 학습 시간이 크게 늘어납니다.
+# 
+
+# ## 라이브러리 설치
+# 
+# | 라이브러리 | 역할 |
+# |---|---|
+# | `unsloth` | LLM 파인튜닝 최적화 |
+# | `trl` | SFTTrainer 제공 |
+# | `peft` | LoRA 어댑터 학습 |
+# | `datasets` | 학습 데이터셋 구성 |
+# 
+
+# In[ ]:
+
+
+# STEP 1: 필수 라이브러리 설치
+get_ipython().system('pip install -q bitsandbytes==0.48.0')
+get_ipython().system('pip install -q "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"')
+get_ipython().system('pip install -q --no-deps trl peft accelerate datasets')
+
+print("설치 완료")
+
+
+# ## 1단계. 모델 로딩
+# 
+# `Qwen2.5-1.5B-Instruct`는 Colab 무료 T4 환경에서 실습하기 좋은 경량 생성 모델입니다.  
+# 4비트 양자화를 켜서 GPU 메모리 사용량을 줄입니다.
+# 
+
+# In[ ]:
+
+
+# STEP 2: 모델 및 토크나이저 로딩
+from unsloth import FastLanguageModel, is_bfloat16_supported
+import torch
+
+MODEL_NAME = "unsloth/Qwen2.5-1.5B-Instruct"
+MAX_SEQ_LENGTH = 2048
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name=MODEL_NAME,
+    max_seq_length=MAX_SEQ_LENGTH,
+    dtype=None,
+    load_in_4bit=True,
+)
+
+print(f"모델 로딩 완료: {MODEL_NAME}")
+print(f"EOS token: {tokenizer.eos_token!r}")
+
+
+# ## 2단계. LoRA 어댑터 설정
+# 
+# LoRA는 전체 모델을 다시 학습하지 않고, 일부 레이어에 작은 학습용 행렬을 추가합니다.  
+# 이번 실습은 말투와 형식을 맞추는 것이 목표라 전체 파인튜닝보다 LoRA가 더 적합합니다.
+# 
+
+# In[ ]:
+
+
+# STEP 3: LoRA 어댑터 구성
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=16,
+    lora_alpha=16,
+    lora_dropout=0,
+    target_modules=[
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    ],
+    bias="none",
+    use_gradient_checkpointing="unsloth",
+    random_state=42,
+    use_rslora=False,
+    loftq_config=None,
+)
+
+print("LoRA 설정 완료")
+
+
+# ## 3단계. 프롬프트 템플릿
+# 
+# 모델이 항상 같은 형식으로 학습하도록 instruction, input, response 구조를 고정합니다.
+# 
+# ```text
+# ### Instruction:
+# 뉴스 설명자의 역할과 출력 규칙
+# 
+# ### Input:
+# 설명할 뉴스 이슈
+# 
+# ### Response:
+# 3문장 설명
+# ```
+# 
+
+# In[ ]:
+
+
+# STEP 4: 프롬프트 템플릿 정의
+alpaca_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+{}
+
+### Input:
+{}
+
+### Response:
+{}"""
+
+TASK_INSTRUCTION = (
+    "너는 뉴스를 쉽고 재밌게 설명하는 진행자다. "
+    "입력된 이슈만 바탕으로 3문장으로 설명하라. "
+    "1문장은 핵심, 2문장은 쉬운 비유, 3문장은 왜 중요한지다. "
+    "없는 사실이나 숫자는 만들지 않는다."
+)
+
+EOS_TOKEN = tokenizer.eos_token
+
+print(TASK_INSTRUCTION)
+
+
+# ## 4단계. 합성 데이터셋 만들기
+# 
+# 학습 목표는 최신 뉴스 지식이 아니라 **재밌게 설명하는 말투와 구조**입니다.  
+# 그래서 실제 최신 기사 대신, 반복적으로 등장하는 사회/경제/기술 이슈를 소재로 합성 데이터를 만듭니다.
+# 
+
+# In[ ]:
+
+
+# STEP 5: 뉴스 설명 스타일 합성 데이터 만들기
+from datasets import Dataset
+
+news_issues = [
+    {
+        "input": "기준금리가 동결됐다는 뉴스",
+        "hook": "돈의 속도를 조절하는 금리 스위치가 이번에는 그대로 멈췄다는 뜻",
+        "metaphor": "자동차로 치면 액셀도 브레이크도 더 밟지 않고 현재 속도를 유지하는 상황",
+        "why": "대출 이자와 예금 이자, 소비 분위기까지 이어질 수 있어서 중요합니다",
+    },
+    {
+        "input": "물가가 다시 오르고 있다는 뉴스",
+        "hook": "같은 장바구니를 채우는 데 필요한 돈이 더 많아지고 있다는 신호",
+        "metaphor": "영수증이 조용히 키가 크는 것처럼 생활비 부담이 슬금슬금 커지는 장면",
+        "why": "가계 소비와 기업 가격 전략, 정부 정책 판단에 모두 영향을 줍니다",
+    },
+    {
+        "input": "반도체 수출이 늘었다는 뉴스",
+        "hook": "한국 경제의 주력 선수 중 하나가 다시 득점 기회를 잡았다는 이야기",
+        "metaphor": "야구에서 중심 타자가 장타를 치면 팀 분위기가 살아나는 것과 비슷합니다",
+        "why": "수출과 투자, 관련 일자리 기대에 연결될 수 있습니다",
+    },
+    {
+        "input": "환율이 올랐다는 뉴스",
+        "hook": "원화로 달러를 사는 비용이 더 비싸졌다는 뜻",
+        "metaphor": "해외 쇼핑 카트에 담긴 물건 가격표가 갑자기 커진 느낌",
+        "why": "수입 물가와 해외여행 비용, 기업 실적에 영향을 줄 수 있습니다",
+    },
+    {
+        "input": "전기차 보조금 기준이 바뀐다는 뉴스",
+        "hook": "전기차를 살 때 받을 수 있는 할인 쿠폰의 조건이 달라지는 상황",
+        "metaphor": "게임 이벤트 보상이 바뀌면 유저들이 공략법을 다시 짜는 것과 같습니다",
+        "why": "소비자 선택과 자동차 회사의 가격 전략이 함께 움직일 수 있습니다",
+    },
+    {
+        "input": "AI 규제가 논의되고 있다는 뉴스",
+        "hook": "AI라는 빠른 기차에 안전벨트와 신호등을 어디까지 달지 정하는 문제",
+        "metaphor": "놀이공원이 재밌어도 안전 규칙이 있어야 오래 운영되는 것과 비슷합니다",
+        "why": "혁신 속도와 개인정보 보호, 책임 소재가 동시에 걸려 있습니다",
+    },
+    {
+        "input": "플랫폼 수수료 논란 뉴스",
+        "hook": "온라인 장터를 빌려 쓰는 비용이 적정한지 따져보는 이슈",
+        "metaphor": "시장 입구 자릿세가 너무 비싸면 가게도 손님도 부담을 느끼는 장면",
+        "why": "소상공인 수익과 소비자 가격에 같이 영향을 줄 수 있습니다",
+    },
+    {
+        "input": "배달비 부담이 커졌다는 뉴스",
+        "hook": "음식값보다 배달비가 더 눈에 띄는 순간이 많아졌다는 이야기",
+        "metaphor": "짜장면을 시켰는데 배달 오토바이 탑승권도 같이 산 기분",
+        "why": "소비 습관과 자영업 매출, 플랫폼 경쟁에 영향을 줍니다",
+    },
+    {
+        "input": "청년 고용이 둔화됐다는 뉴스",
+        "hook": "사회에 막 들어서는 사람들이 첫 출발선을 통과하기 어려워졌다는 신호",
+        "metaphor": "출발 총성은 울렸는데 경기장 문이 좁아진 상황",
+        "why": "소득, 주거, 소비 계획이 줄줄이 영향을 받을 수 있습니다",
+    },
+    {
+        "input": "전세 사기 방지 대책 뉴스",
+        "hook": "집을 빌릴 때 보증금을 지키는 안전장치를 더 촘촘히 만들자는 내용",
+        "metaphor": "큰돈을 맡기는 금고에 잠금장치를 하나 더 다는 것과 같습니다",
+        "why": "주거 안정과 부동산 시장 신뢰에 직접 연결됩니다",
+    },
+    {
+        "input": "폭염 대비 정책 뉴스",
+        "hook": "더운 날씨가 건강 문제로 번지지 않게 미리 방어막을 치는 일",
+        "metaphor": "여름 보스전이 오기 전에 물약과 방패를 챙기는 상황",
+        "why": "취약계층 보호와 전력 수요 관리가 함께 중요해집니다",
+    },
+    {
+        "input": "재생에너지 투자가 늘었다는 뉴스",
+        "hook": "전기를 만드는 방식을 더 깨끗한 방향으로 바꾸려는 움직임",
+        "metaphor": "오래된 보일러만 쓰던 집에 태양광 창문을 추가하는 느낌",
+        "why": "기후 대응과 에너지 안보, 산업 경쟁력에 모두 관련됩니다",
+    },
+    {
+        "input": "사이버 보안 사고 뉴스",
+        "hook": "디지털 세상의 문단속이 뚫렸다는 경고음",
+        "metaphor": "집 현관은 잠갔는데 와이파이 창문이 열려 있었던 상황",
+        "why": "개인정보와 기업 신뢰, 서비스 운영 안정성에 영향을 줍니다",
+    },
+    {
+        "input": "개인정보 보호 강화 뉴스",
+        "hook": "내 데이터가 어디에 쓰이는지 더 엄격하게 관리하자는 흐름",
+        "metaphor": "내 이름표가 붙은 짐을 아무나 열어보지 못하게 잠그는 일",
+        "why": "편리한 서비스와 사생활 보호 사이의 균형을 정하는 문제입니다",
+    },
+    {
+        "input": "K-콘텐츠 해외 흥행 뉴스",
+        "hook": "한국 콘텐츠가 해외 관객의 리모컨을 붙잡았다는 이야기",
+        "metaphor": "동네 맛집이 갑자기 세계 푸드코트의 인기 매장이 된 느낌",
+        "why": "제작 투자와 관광, 브랜드 이미지에 긍정적인 파급이 생길 수 있습니다",
+    },
+    {
+        "input": "우주 발사체 개발 뉴스",
+        "hook": "우주로 물건을 보내는 자체 배송 능력을 키우는 일",
+        "metaphor": "남의 택배차만 기다리던 회사가 자기 로켓 택배차를 만드는 상황",
+        "why": "과학기술 경쟁력과 위성 산업의 기반이 됩니다",
+    },
+    {
+        "input": "디지털 교과서 도입 뉴스",
+        "hook": "교과서가 종이책에서 화면 속 맞춤형 도구로 바뀌는 흐름",
+        "metaphor": "칠판과 문제집이 태블릿 안에서 한 팀이 되는 장면",
+        "why": "학습 격차, 교사 준비, 학생 집중도까지 함께 따져봐야 합니다",
+    },
+    {
+        "input": "대중교통 요금 인상 뉴스",
+        "hook": "매일 타는 이동 서비스의 기본 가격표가 바뀌는 일",
+        "metaphor": "출근길 커피값이 오른 것처럼 작아 보여도 매일 쌓이면 크게 느껴집니다",
+        "why": "가계 부담과 교통 재정, 서비스 품질 문제가 함께 얽혀 있습니다",
+    },
+    {
+        "input": "중고거래 사기 예방 뉴스",
+        "hook": "싸게 사려다 비싸게 배우는 일을 줄이자는 이야기",
+        "metaphor": "온라인 벼룩시장에서 계산대와 CCTV를 더 밝게 켜는 느낌",
+        "why": "개인 간 거래가 커질수록 신뢰 장치가 더 중요해집니다",
+    },
+    {
+        "input": "게임 확률형 아이템 공개 뉴스",
+        "hook": "뽑기 상자의 당첨 확률표를 더 투명하게 보자는 이슈",
+        "metaphor": "자판기에 동전을 넣기 전에 어떤 음료가 얼마나 나오는지 확인하는 셈",
+        "why": "소비자 보호와 게임사의 수익 모델 신뢰가 같이 걸려 있습니다",
+    },
+    {
+        "input": "소상공인 대출 지원 뉴스",
+        "hook": "작은 가게들이 숨 고를 시간을 벌도록 자금 길을 열어주는 정책",
+        "metaphor": "비 오는 날 장사하는 가게에 잠깐 큰 우산을 씌워주는 장면",
+        "why": "지역 경제와 고용 유지에 영향을 줄 수 있습니다",
+    },
+    {
+        "input": "부동산 대출 규제 변화 뉴스",
+        "hook": "집을 살 때 빌릴 수 있는 돈의 문턱이 달라지는 문제",
+        "metaphor": "놀이기구 키 제한이 바뀌면 탈 수 있는 사람이 달라지는 것과 비슷합니다",
+        "why": "주택 수요와 가계부채, 시장 안정에 연결됩니다",
+    },
+    {
+        "input": "농산물 가격 변동 뉴스",
+        "hook": "밥상에 올라오는 재료 가격이 날씨와 유통 상황에 따라 흔들리는 이야기",
+        "metaphor": "김치찌개 재료들이 각자 다른 롤러코스터를 타는 느낌",
+        "why": "가계 장바구니와 농가 소득 모두에 영향을 줍니다",
+    },
+    {
+        "input": "택배 자동화 확대 뉴스",
+        "hook": "물류센터에서 사람이 하던 반복 작업을 기계가 더 많이 맡는 흐름",
+        "metaphor": "상자들이 컨베이어벨트 위에서 자기 길을 찾아가는 미니 도시 같습니다",
+        "why": "배송 속도와 노동 환경, 일자리 구조가 함께 바뀔 수 있습니다",
+    },
+    {
+        "input": "해외여행 수요 증가 뉴스",
+        "hook": "사람들이 다시 여권을 꺼내고 여행 계획을 세우는 분위기",
+        "metaphor": "서랍 속에서 잠자던 캐리어가 드디어 출근 준비를 하는 장면",
+        "why": "항공, 숙박, 환율, 소비 흐름에 연쇄 효과가 생길 수 있습니다",
+    },
+    {
+        "input": "택시 호출 앱 경쟁 뉴스",
+        "hook": "택시를 부르는 화면 안에서 플랫폼들이 손님 잡기 경쟁을 벌이는 일",
+        "metaphor": "길거리 호객 경쟁이 스마트폰 앱 안으로 들어온 셈",
+        "why": "요금, 배차 속도, 기사 수익에 모두 영향을 줄 수 있습니다",
+    },
+    {
+        "input": "의료 인력 부족 뉴스",
+        "hook": "병원 현장의 일손과 환자 수요가 잘 맞지 않는다는 신호",
+        "metaphor": "식당에 손님은 몰리는데 주방 인력이 부족한 상황과 비슷합니다",
+        "why": "진료 대기와 지역 의료 접근성에 직접 영향을 줍니다",
+    },
+    {
+        "input": "기후 변화 대응 회의 뉴스",
+        "hook": "지구 온도라는 공용 온도계를 어떻게 낮출지 나라들이 의논하는 자리",
+        "metaphor": "같은 아파트에 사는 사람들이 난방비와 환기 규칙을 함께 정하는 느낌",
+        "why": "산업 정책과 에너지 비용, 미래 재난 위험이 함께 달려 있습니다",
+    },
+    {
+        "input": "대형마트 새벽배송 논의 뉴스",
+        "hook": "장을 보는 시간을 더 넓힐지, 기존 상권을 어떻게 보호할지 따지는 이슈",
+        "metaphor": "편의성이라는 빠른 엘리베이터와 골목상권이라는 계단을 같이 보는 문제",
+        "why": "소비자 편의와 유통업 경쟁, 소상공인 보호가 맞물려 있습니다",
+    },
+    {
+        "input": "학교 급식 물가 상승 뉴스",
+        "hook": "학생들의 한 끼 식판을 채우는 비용이 높아지고 있다는 이야기",
+        "metaphor": "급식판 위 반찬들이 조용히 가격표를 들고 있는 장면",
+        "why": "교육 예산과 식사 품질, 학부모 부담에 영향을 줄 수 있습니다",
+    },
+    {
+        "input": "로봇 배송 실험 뉴스",
+        "hook": "사람 대신 로봇이 짐을 들고 동네를 다니는 서비스 실험",
+        "metaphor": "작은 캐리어가 길을 외워서 혼자 심부름을 가는 느낌",
+        "why": "편리함과 안전 규칙, 보행 공간 관리가 함께 중요해집니다",
+    },
+    {
+        "input": "온라인 교육 플랫폼 성장 뉴스",
+        "hook": "배움의 교실이 학교 건물 밖 화면으로 더 넓어지는 흐름",
+        "metaphor": "책상 하나가 전국의 강의실 문을 열 수 있는 리모컨이 된 셈",
+        "why": "교육 접근성과 콘텐츠 품질, 학습 관리 방식이 달라질 수 있습니다",
+    },
+]
+
+raw_data = []
+for item in news_issues:
+    raw_data.append({
+        "instruction": TASK_INSTRUCTION,
+        "input": item["input"],
+        "output": f"핵심은 {item['hook']}입니다. 쉽게 말해 {item['metaphor']}. 그래서 {item['why']}.",
+    })
+    raw_data.append({
+        "instruction": TASK_INSTRUCTION,
+        "input": item["input"] + "를 초등학생도 이해하게 설명해줘",
+        "output": f"오늘의 관전 포인트는 {item['hook']}예요. 비유하자면 {item['metaphor']}. 이게 중요한 이유는 {item['why']}.",
+    })
+
+dataset = Dataset.from_list(raw_data).shuffle(seed=42)
+dataset = dataset.train_test_split(test_size=0.1, seed=42)
+
+print(f"학습 데이터 수: {len(dataset['train'])}개")
+print(f"검증 데이터 수: {len(dataset['test'])}개")
+print(dataset["train"][0])
+
+
+# ## 5단계. 학습 포맷 변환
+# 
+# 각 샘플을 Alpaca 스타일 프롬프트 하나로 합칩니다.  
+# EOS 토큰을 붙여서 모델이 응답의 끝을 배울 수 있게 합니다.
+# 
+
+# In[ ]:
+
+
+# STEP 6: 데이터 포맷 변환
+def format_instruction(example):
+    return {
+        "text": alpaca_prompt.format(
+            example["instruction"],
+            example["input"],
+            example["output"],
+        ) + EOS_TOKEN
+    }
+
+train_data = dataset["train"].map(format_instruction, batched=False)
+eval_data = dataset["test"].map(format_instruction, batched=False)
+
+print("변환된 학습 샘플:")
+print("=" * 80)
+print(train_data[0]["text"])
+
+
+# ## 6단계. 파인튜닝 전 베이스 모델 응답 확인
+# 
+# 같은 테스트 입력 5개를 파인튜닝 전후로 비교합니다.  
+# 과제 기준의 **최소 5개 예시**를 만족하도록 고정 테스트 케이스를 사용합니다.
+# 
+
+# In[ ]:
+
+
+# STEP 7: 추론 함수 정의 및 파인튜닝 전 응답 확인
+def generate_response(model, tokenizer, user_input, max_new_tokens=180, do_sample=False):
+    prompt = alpaca_prompt.format(TASK_INSTRUCTION, user_input, "")
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    generation_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": do_sample,
+        "pad_token_id": tokenizer.eos_token_id,
+    }
+    if do_sample:
+        generation_kwargs.update({
+            "temperature": 0.7,
+            "top_p": 0.9,
+        })
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            **generation_kwargs,
+        )
+
+    generated = outputs[0][inputs["input_ids"].shape[1]:]
+    return tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+
+test_cases = [
+    "물가가 오르는 뉴스를 친구에게 설명해줘",
+    "AI 규제 논의를 뉴스 진행자처럼 설명해줘",
+    "환율이 올랐다는 이슈를 쉽게 설명해줘",
+    "전기차 보조금 기준 변경 뉴스를 재밌게 설명해줘",
+    "사이버 보안 사고가 왜 중요한지 설명해줘",
+]
+
+comparison_rows = []
+
+print("=" * 80)
+print("[BEFORE] 파인튜닝 전 베이스 모델 답변")
+print("=" * 80)
+for case in test_cases:
+    before = generate_response(model, tokenizer, case)
+    comparison_rows.append({"input": case, "before": before, "after": ""})
+    print(f"입력: {case}")
+    print(f"출력: {before}")
+    print("-" * 80)
+
+
+# ## 7단계. 학습 설정 및 SFTTrainer 구성
+# 
+# 작은 데이터셋으로 스타일을 빠르게 학습하는 실습이므로 `max_steps=80`으로 제한합니다.  
+# 더 강하게 학습하고 싶다면 `max_steps`를 120~200 정도로 늘릴 수 있습니다.
+# 
+
+# In[ ]:
+
+
+# STEP 8: 학습 설정 및 Trainer 구성
+from transformers import TrainingArguments
+from trl import SFTTrainer
+
+training_args = TrainingArguments(
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=4,
+    max_steps=80,
+    learning_rate=2e-4,
+    warmup_steps=10,
+    bf16=is_bfloat16_supported(),
+    fp16=not is_bfloat16_supported(),
+    logging_steps=10,
+    optim="adamw_8bit",
+    weight_decay=0.01,
+    lr_scheduler_type="linear",
+    output_dir="outputs",
+    seed=42,
+    report_to="none",
+)
+
+trainer = SFTTrainer(
+    model=model,
+    tokenizer=tokenizer,
+    train_dataset=train_data,
+    eval_dataset=eval_data,
+    dataset_text_field="text",
+    max_seq_length=MAX_SEQ_LENGTH,
+    dataset_num_proc=2,
+    packing=False,
+    args=training_args,
+)
+
+print("SFTTrainer 구성 완료")
+
+
+# ## 8단계. 학습 실행
+
+# In[ ]:
+
+
+# STEP 9: 학습 실행
+trainer_stats = trainer.train()
+
+print("학습 완료")
+print(f"총 학습 시간: {trainer_stats.metrics['train_runtime']:.1f}초")
+print(f"최종 Loss: {trainer_stats.metrics['train_loss']:.4f}")
+
+
+# ## 9단계. 파인튜닝 후 응답 비교
+# 
+# 파인튜닝 전과 같은 5개 입력을 다시 넣어 응답의 구조와 말투가 바뀌었는지 확인합니다.
+# 
+
+# In[ ]:
+
+
+# STEP 10: 파인튜닝 후 모델 답변 확인
+FastLanguageModel.for_inference(model)
+
+print("=" * 80)
+print("[AFTER] 파인튜닝 후 모델 답변")
+print("=" * 80)
+for row in comparison_rows:
+    after = generate_response(model, tokenizer, row["input"])
+    row["after"] = after
+    print(f"입력: {row['input']}")
+    print(f"BEFORE: {row['before']}")
+    print(f"AFTER : {row['after']}")
+    print("-" * 80)
+
+
+# ## 10단계. 새 이슈로 직접 테스트
+
+# In[ ]:
+
+
+# STEP 11: 자유 테스트
+custom_inputs = [
+    "대중교통 요금 인상 뉴스를 재밌게 설명해줘",
+    "디지털 교과서 도입 뉴스를 쉽게 설명해줘",
+    "로봇 배송 실험 뉴스를 뉴스 진행자처럼 설명해줘",
+]
+
+for text in custom_inputs:
+    print(f"입력: {text}")
+    print(generate_response(model, tokenizer, text, do_sample=True))
+    print("-" * 80)
+
+
+# ## 11단계. LoRA 어댑터 저장
+# 
+# 전체 모델이 아니라 학습된 LoRA 어댑터만 저장합니다.  
+# 나중에 같은 베이스 모델 위에 이 어댑터를 얹어서 사용할 수 있습니다.
+# 
+
+# In[ ]:
+
+
+# STEP 12: LoRA 어댑터 저장
+import os
+
+SAVE_PATH = "./news-fun-style-lora"
+
+model.save_pretrained(SAVE_PATH)
+tokenizer.save_pretrained(SAVE_PATH)
+
+print(f"저장 완료: {SAVE_PATH}")
+print("저장된 파일:")
+for filename in sorted(os.listdir(SAVE_PATH)):
+    size = os.path.getsize(os.path.join(SAVE_PATH, filename)) / 1024
+    print(f"- {filename}: {size:.1f} KB")
+
+
+# ## 선택. Hugging Face Hub 업로드
+
+# In[ ]:
+
+
+# 선택 사항: Hugging Face Hub에 업로드할 때만 실행하세요.
+# 1. 왼쪽 열쇠 아이콘에서 HF_TOKEN을 Colab secret으로 등록합니다.
+# 2. 아래 HF_REPO_ID를 본인 계정명/모델명으로 바꿉니다.
+
+# from google.colab import userdata
+# from huggingface_hub import login
+#
+# HF_REPO_ID = "rud472888-creator/news-fun-style-qwen-lora"
+# login(token=userdata.get("HF_TOKEN"))
+# model.push_to_hub(HF_REPO_ID)
+# tokenizer.push_to_hub(HF_REPO_ID)
+#
+# print(f"업로드 완료: https://huggingface.co/{HF_REPO_ID}")
+
+
+# ## 제출 체크리스트
+# 
+# - Colab 노트북: `news_fun_style_finetuning.ipynb`
+# - 코드 리뷰용 변환 파일: `news_fun_style_finetuning.py`
+# - 파인튜닝 전후 비교: 노트북 9단계에서 5개 입력 비교
+# - PR 본문 한 줄 설명:
+# 
+# ```text
+# 모델은 Colab T4에서 안정적으로 돌아가는 Qwen2.5-1.5B-Instruct를 선택했고, 데이터셋은 뉴스 사실이 아니라 재미있는 설명 말투를 학습시키기 위해 범용 이슈 기반 합성 데이터로 직접 구성했습니다.
+# ```
+# 
