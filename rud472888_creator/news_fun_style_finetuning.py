@@ -3,6 +3,8 @@
 
 # # 뉴스 재미있게 설명하는 말투 LoRA 파인튜닝
 # 
+# [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rud472888-creator/4-finetuning/blob/rud472888-creator-news-fun-style/rud472888_creator/news_fun_style_finetuning.ipynb)
+# 
 # 사전학습된 **Qwen2.5-1.5B-Instruct** 모델을 작은 합성 데이터셋으로 파인튜닝해서, 딱딱한 뉴스 이슈를 쉽고 재밌게 설명하는 모델을 만듭니다.
 # 
 # | 항목 | 내용 |
@@ -27,6 +29,20 @@
 # 
 # GPU 없이 실행하면 학습 시간이 크게 늘어납니다.
 # 
+
+# In[ ]:
+
+
+# Colab GPU 확인
+import torch
+
+print(f"GPU 사용 가능: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"GPU 모델: {torch.cuda.get_device_name(0)}")
+    print(f"GPU 메모리: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+else:
+    print("GPU가 꺼져 있습니다. 런타임 유형에서 T4 GPU를 선택한 뒤 다시 실행하세요.")
+
 
 # ## 라이브러리 설치
 # 
@@ -460,8 +476,8 @@ for case in test_cases:
 
 # ## 7단계. 학습 설정 및 SFTTrainer 구성
 # 
-# 작은 데이터셋으로 스타일을 빠르게 학습하는 실습이므로 `max_steps=80`으로 제한합니다.  
-# 더 강하게 학습하고 싶다면 `max_steps`를 120~200 정도로 늘릴 수 있습니다.
+# Colab에서 먼저 되는지만 확인하려면 `QUICK_TEST_MODE = True` 그대로 실행합니다.  
+# 제출용 결과를 더 안정적으로 보고 싶다면 한 번 성공 확인 후 `False`로 바꾸고 다시 학습합니다.
 # 
 
 # In[ ]:
@@ -471,10 +487,13 @@ for case in test_cases:
 from transformers import TrainingArguments
 from trl import SFTTrainer
 
+QUICK_TEST_MODE = True
+TRAINING_MAX_STEPS = 20 if QUICK_TEST_MODE else 80
+
 training_args = TrainingArguments(
     per_device_train_batch_size=2,
     gradient_accumulation_steps=4,
-    max_steps=80,
+    max_steps=TRAINING_MAX_STEPS,
     learning_rate=2e-4,
     warmup_steps=10,
     bf16=is_bfloat16_supported(),
@@ -500,7 +519,7 @@ trainer = SFTTrainer(
     args=training_args,
 )
 
-print("SFTTrainer 구성 완료")
+print(f"SFTTrainer 구성 완료: max_steps={TRAINING_MAX_STEPS}")
 
 
 # ## 8단계. 학습 실행
